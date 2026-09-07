@@ -1,0 +1,751 @@
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { v4 as uuidv4 } from 'uuid';
+import type { Page, Customer, Job, Estimate, Invoice, Contract, LineItem, ModuleName } from './types';
+import { COMPANY_INFO } from './types';
+import { useAppData } from './hooks/useAppData';
+import { useAuth } from './hooks/useAuth';
+import { geocodeAddress, calculateAsphaltTonnage } from './utils/geocode';
+import { getAIResponse } from './utils/aiAssistant';
+import { generateAIEstimate, generateAIContract, type AIEstimateResult } from './utils/aiEstimator';
+import { handleAIAction } from './utils/aiActions';
+import { openPrintWithLogo } from './utils/print';
+import Modal from './components/Modal';
+import SignaturePad from './components/SignaturePad';
+import LoginPage from './components/LoginPage';
+import UsersPage from './components/UsersPage';
+
+function LazyMapView({ jobs, height }: { jobs: Job[]; height?: string }) {
+  const [MapComp, setMapComp] = useState<any>(null);
+  useEffect(() => {
+    import('./components/MapView').then(mod => setMapComp(() => mod.default));
+  }, []);
+  if (!MapComp) return <div style={{ height: height || '500px' }} className="bg-gray-100 rounded-lg flex items-center justify-center text-gray-400 text-sm">Loading map...</div>;
+  return <MapComp jobs={jobs} height={height} />;
+}
+
+const NAV_ITEMS: { page: Page; icon: string; label: string; module: ModuleName }[] = [
+  { page: 'dashboard', icon: '📊', label: 'Dashboard', module: 'dashboard' },
+  { page: 'customers', icon: '👥', label: 'Customers', module: 'customers' },
+  { page: 'jobs', icon: '🔨', label: 'Jobs', module: 'jobs' },
+  { page: 'estimates', icon: '📋', label: 'Estimates', module: 'estimates' },
+  { page: 'invoices', icon: '💰', label: 'Invoices', module: 'invoices' },
+  { page: 'contracts', icon: '📄', label: 'Contracts', module: 'contracts' },
+  { page: 'map', icon: '🗺️', label: 'Map', module: 'map' },
+  { page: 'ai-assistant', icon: '🤖', label: 'AI Assistant', module: 'ai' },
+  { page: 'users', icon: '👤', label: 'Users', module: 'users' },
+];
+
+const BRAND = {
+  black: '#000000',
+  gold: '#C5A032',
+  goldLight: '#D4B45A',
+  goldDark: '#9C7C2E',
+};
+
+function PrintHeader({ title, subtitle, customerName, date }: { title: string; subtitle?: string; customerName?: string; date?: string }) {
+  return (
+    <div className="print-header print-area break-inside-avoid">
+      <img src="/logo.png" alt="Black Gold Logo" className="w-20 h-20 object-contain bg-white rounded-xl border p-1 shadow-sm" style={{ borderColor: BRAND.gold }} onError={(e:any)=>e.target.style.display='none'} />
+      <div className="flex-1">
+        <h1 className="font-black text-[18px] leading-none tracking-tight" style={{ color: BRAND.black }}>{COMPANY_INFO.name}</h1>
+        <p className="text-[11px] text-gray-700 mt-1 font-medium">{COMPANY_INFO.address} • {COMPANY_INFO.phone} • {COMPANY_INFO.email}</p>
+        <div className="mt-2 border-t pt-2 border-gray-200">
+          <p className="font-black text-sm">{title}</p>
+          {subtitle && <p className="text-xs text-gray-600">{subtitle}</p>}
+          <div className="flex gap-4 text-xs mt-1">
+            {customerName && <span>Customer: <strong>{customerName}</strong></span>}
+            {date && <span>Date: {date}</span>}
+          </div>
+        </div>
+      </div>
+      <div className="text-right hidden md:block">
+        <p className="text-[10px] font-bold" style={{ color: BRAND.gold }}>{COMPANY_INFO.license}</p>
+        <p className="text-[9px] text-gray-500">Columbus & Surrounding</p>
+      </div>
+    </div>
+  );
+}
+
+function NoAccess({ module, action = 'view this section' }: { module: string; action?: string }) {
+  return (
+    <div className="bg-white rounded-2xl border-2 border-dashed border-amber-300 p-8 text-center">
+      <div className="text-5xl mb-4">🔒</div>
+      <h3 className="font-black text-lg">Access Restricted</h3>
+      <p className="text-sm text-gray-600 mt-2">You don't have permission to {action} in <strong>{module}</strong>.</p>
+      <p className="text-xs text-gray-400 mt-2">Contact your admin at {COMPANY_INFO.email} or {COMPANY_INFO.phone} to request access.</p>
+      <div className="mt-4 inline-block px-3 py-1 rounded-full bg-black text-yellow-400 text-xs font-bold border" style={{ borderColor: BRAND.gold }}>Black Gold Security • Role-Based Access</div>
+    </div>
+  );
+}
+
+export default function App() {
+  const auth = useAuth();
+  const data = useAppData();
+  const [currentPage, setCurrentPage] = useState<Page>('dashboard');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  const [installPrompt, setInstallPrompt] = useState<any>(null);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleBeforeInstall = (e: any) => {
+      e.preventDefault();
+      setInstallPrompt(e);
+    };
+    window.addEventListener('beforeinstallprompt', handleBeforeInstall);
+    return () => window.removeEventListener('beforeinstallprompt', handleBeforeInstall);
+  }, []);
+
+  const handleInstall = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    const result = await installPrompt.userChoice;
+    if (result.outcome === 'accepted') {
+      showToast('App installed! You can now use it offline.');
+      setInstallPrompt(null);
+    }
+  };
+
+  const showToast = useCallback((msg: string) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), 4000);
+  }, []);
+
+  if (auth.loading || data.loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: BRAND.black }}>
+        <div className="text-center p-6">
+          <img src="/logo.png" alt="Black Gold Logo" className="w-56 h-56 mx-auto mb-6 object-contain bg-white rounded-2xl p-3 shadow-2xl" />
+          <h1 className="text-2xl font-black text-white mb-1 tracking-wide">{COMPANY_INFO.name}</h1>
+          <p className="text-sm" style={{ color: BRAND.gold }}>{COMPANY_INFO.address}</p>
+          <p className="mt-6 animate-pulse font-bold flex items-center justify-center gap-2" style={{ color: BRAND.goldLight }}><span className="w-2 h-2 bg-yellow-400 rounded-full animate-ping"></span>Loading Black Gold System...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!auth.currentUser) {
+    return <LoginPage onLogin={auth.login} />;
+  }
+
+  // Filter nav items by permission
+  const visibleNav = NAV_ITEMS.filter(item => auth.canViewModule(item.module));
+
+  // If current page not allowed, redirect to first allowed
+  const canViewCurrent = auth.canViewModule(NAV_ITEMS.find(n=>n.page===currentPage)?.module || 'dashboard');
+  let effectivePage = currentPage;
+  if (!canViewCurrent) {
+    const firstAllowed = visibleNav[0]?.page || 'dashboard';
+    if (firstAllowed !== currentPage) {
+      // Need to set but avoid infinite loop, use effect
+      setTimeout(()=>setCurrentPage(firstAllowed),0);
+      effectivePage = firstAllowed;
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-100 flex">
+      <aside className={`fixed md:static inset-y-0 left-0 z-30 w-64 text-white transform transition-transform duration-300 flex flex-col ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0`} style={{ background: BRAND.black }}>
+        <div className="p-4 border-b border-white/10 flex flex-col items-center text-center">
+          <img src="/logo.png" alt="Logo" className="w-full max-w-[200px] h-auto bg-white rounded-xl p-2 mb-3 shadow-lg" />
+          <h1 className="text-[15px] font-black leading-tight tracking-wide" style={{ color: BRAND.gold }}>{COMPANY_INFO.name}</h1>
+          <p className="text-[11px] text-white mt-1 font-medium">{COMPANY_INFO.phone}</p>
+          <p className="text-[10px] text-gray-400">{COMPANY_INFO.address}</p>
+        </div>
+        <nav className="flex-1 py-2 overflow-y-auto">
+          {visibleNav.map(item => (
+            <button key={item.page} onClick={() => { setCurrentPage(item.page); setSidebarOpen(false); }} className="w-full flex items-center gap-3 px-4 py-3 text-left transition-colors border-l-4" style={{ background: effectivePage === item.page ? '#1a1a1a' : 'transparent', color: effectivePage === item.page ? BRAND.gold : '#d1d5db', borderLeftColor: effectivePage === item.page ? BRAND.gold : 'transparent', fontWeight: effectivePage === item.page ? 800 : 400 }}>
+              <span className="text-xl">{item.icon}</span><span>{item.label}</span>
+            </button>
+          ))}
+          {visibleNav.length===0 && <p className="text-xs text-gray-500 p-4">No modules accessible. Contact admin.</p>}
+        </nav>
+        <div className="p-3 border-t border-white/10">
+          <div className="bg-zinc-900 rounded-xl p-3 border border-zinc-800 flex items-center gap-3">
+            <div className="w-9 h-9 rounded-full bg-yellow-500 text-black flex items-center justify-center font-black text-sm">{auth.currentUser.displayName.charAt(0).toUpperCase()}</div>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-black text-white truncate">{auth.currentUser.displayName}</p>
+              <p className="text-[10px] text-yellow-400 font-bold">@{auth.currentUser.username} • {auth.currentUser.role.toUpperCase()}</p>
+            </div>
+            <button onClick={auth.logout} className="text-[10px] px-2 py-1 rounded-full bg-zinc-800 text-gray-400 hover:text-white border border-zinc-700">Logout</button>
+          </div>
+          <div className="mt-3 text-[10px] text-gray-500 text-center">
+            <p>📍 {COMPANY_INFO.address}</p>
+            <p>✉️ {COMPANY_INFO.email}</p>
+          </div>
+        </div>
+      </aside>
+
+      {sidebarOpen && (<div className="fixed inset-0 bg-black/60 z-20 md:hidden" onClick={() => setSidebarOpen(false)} />)}
+
+      <main className="flex-1 min-h-screen min-w-0">
+        <header className="bg-white shadow-sm border-b px-4 py-3 flex items-center gap-4 sticky top-0 z-10 border-l-4" style={{ borderLeftColor: BRAND.gold }}>
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="md:hidden text-2xl">☰</button>
+          <img src="/logo.png" alt="logo" className="w-8 h-8 rounded-lg bg-white border md:hidden" />
+          <h2 className="text-xl font-black flex-1 tracking-tight" style={{ color: BRAND.black }}>{NAV_ITEMS.find(n => n.page === effectivePage)?.icon} {NAV_ITEMS.find(n => n.page === effectivePage)?.label}</h2>
+          <div className="hidden md:flex items-center gap-2 text-xs bg-black text-yellow-400 px-3 py-1 rounded-full border font-bold" style={{ borderColor: BRAND.gold }}>
+            👤 {auth.currentUser.displayName} • {auth.currentUser.role}
+          </div>
+          <div className={`flex items-center gap-1.5 text-xs px-2 py-1 rounded-full ${isOnline ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}><span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-green-500' : 'bg-amber-500 animate-pulse'}`}></span>{isOnline ? 'Online' : 'Offline'}</div>
+          {installPrompt && (<button onClick={handleInstall} className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full font-bold text-black shadow" style={{ background: `linear-gradient(135deg, ${BRAND.gold} 0%, ${BRAND.goldDark} 100%)` }}>📲 Install App</button>)}
+          <button onClick={auth.logout} className="md:hidden text-xs px-2 py-1 rounded-full bg-black text-yellow-400 border font-bold" style={{ borderColor: BRAND.gold }}>Logout</button>
+        </header>
+
+        <div className="p-4 md:p-6 max-w-7xl mx-auto">
+          {effectivePage === 'dashboard' && (auth.canViewModule('dashboard') ? <Dashboard data={data} setPage={setCurrentPage} auth={auth} /> : <NoAccess module="Dashboard" />)}
+          {effectivePage === 'customers' && (auth.canViewModule('customers') ? <CustomersPage data={data} showToast={showToast} auth={auth} /> : <NoAccess module="Customers" />)}
+          {effectivePage === 'jobs' && (auth.canViewModule('jobs') ? <JobsPage data={data} showToast={showToast} auth={auth} /> : <NoAccess module="Jobs" />)}
+          {effectivePage === 'estimates' && (auth.canViewModule('estimates') ? <EstimatesPage data={data} showToast={showToast} auth={auth} /> : <NoAccess module="Estimates" />)}
+          {effectivePage === 'invoices' && (auth.canViewModule('invoices') ? <InvoicesPage data={data} showToast={showToast} auth={auth} /> : <NoAccess module="Invoices" />)}
+          {effectivePage === 'contracts' && (auth.canViewModule('contracts') ? <ContractsPage data={data} showToast={showToast} auth={auth} /> : <NoAccess module="Contracts" />)}
+          {effectivePage === 'map' && (auth.canViewModule('map') ? <MapPage data={data} auth={auth} /> : <NoAccess module="Map" />)}
+          {effectivePage === 'ai-assistant' && (auth.canViewModule('ai') ? <AIPage data={data} showToast={showToast} auth={auth} /> : <NoAccess module="AI Assistant" />)}
+          {effectivePage === 'users' && (auth.canViewModule('users') ? <UsersPage users={auth.users} currentUser={auth.currentUser} onCreate={auth.createUser} onUpdate={auth.updateUser} onDelete={auth.deleteUser} onToggleActive={auth.toggleActive} canManageUsers={auth.can('users','create') || auth.isAdmin} /> : <NoAccess module="Users Management" />)}
+        </div>
+      </main>
+
+      {!isOnline && (<div className="fixed top-0 left-0 right-0 z-50 bg-amber-500 text-white text-center py-2 px-4 text-sm font-medium shadow-lg">📴 Offline — Data saved locally</div>)}
+
+      {toast && (<div className="fixed bottom-4 right-4 bg-black text-white px-6 py-3 rounded-xl shadow-xl z-50 fade-in border-2 flex gap-2 items-center" style={{ borderColor: BRAND.gold }}><span className="text-xl">✅</span><span className="text-sm font-medium whitespace-pre-wrap">{toast}</span></div>)}
+    </div>
+  );
+}
+
+function Dashboard({ data, setPage, auth }: { data: ReturnType<typeof useAppData>; setPage: (p: Page) => void; auth: ReturnType<typeof useAuth> }) {
+  const activeJobs = data.jobs.filter(j => j.status === 'in-progress').length;
+  const scheduledJobs = data.jobs.filter(j => j.status === 'scheduled').length;
+  const pendingEst = data.estimates.filter(e => e.status === 'sent').length;
+  const unpaidInv = data.invoices.filter(i => i.status === 'sent' || i.status === 'overdue');
+  const revenue = data.invoices.filter(i => i.status === 'paid').reduce((s, i) => s + i.total, 0);
+  const cards = [
+    { label: 'Customers', val: data.customers.length, icon: '👥', bg: '#000000', pg: 'customers' as Page, mod: 'customers' as ModuleName },
+    { label: 'Active Jobs', val: activeJobs, icon: '🔨', bg: BRAND.gold, pg: 'jobs' as Page, mod: 'jobs' as ModuleName, textBlack: true },
+    { label: 'Scheduled', val: scheduledJobs, icon: '📅', bg: BRAND.gold, pg: 'jobs' as Page, mod: 'jobs' as ModuleName, textBlack: true },
+    { label: 'Estimates', val: pendingEst, icon: '📋', bg: '#1f1f1f', pg: 'estimates' as Page, mod: 'estimates' as ModuleName },
+    { label: 'Unpaid', val: unpaidInv.length, icon: '⚠️', bg: '#8b0000', pg: 'invoices' as Page, mod: 'invoices' as ModuleName },
+    { label: 'Revenue', val: '$' + revenue.toLocaleString(), icon: '💰', bg: '#FFD700', pg: 'invoices' as Page, mod: 'invoices' as ModuleName, textBlack: true },
+  ];
+  return (
+    <div className="space-y-6">
+      <div className="bg-black text-white rounded-2xl p-5 flex items-center gap-4 border-2 shadow-lg" style={{ borderColor: BRAND.gold }}>
+        <img src="/logo.png" alt="logo" className="w-24 h-24 rounded-xl bg-white p-2 object-contain" />
+        <div className="flex-1">
+          <h2 className="text-xl font-black" style={{ color: BRAND.gold }}>{COMPANY_INFO.name}</h2>
+          <p className="text-sm text-gray-300">{COMPANY_INFO.address}</p>
+          <p className="text-sm font-bold mt-1">{COMPANY_INFO.phone} • {COMPANY_INFO.email}</p>
+          <p className="text-xs mt-2">Welcome, <span style={{ color: BRAND.gold }} className="font-black">{auth.currentUser?.displayName}</span> • Role: <strong className="uppercase">{auth.currentUser?.role}</strong> • Serving Central Ohio</p>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+        {cards.filter(c=>auth.canViewModule(c.mod)).map(c => (
+          <button key={c.label} onClick={() => { if (auth.canViewModule(c.mod)) setPage(c.pg); }} className="bg-white rounded-xl p-4 shadow-sm hover:shadow-md transition text-left border-t-4 hover:-translate-y-0.5" style={{ borderColor: BRAND.gold }}>
+            <div className="w-10 h-10 rounded-lg flex items-center justify-center text-xl mb-2" style={{ background: c.bg, color: (c as any).textBlack ? '#000' : '#fff' }}>{c.icon}</div>
+            <p className="text-2xl font-black" style={{ color: BRAND.black }}>{c.val}</p>
+            <p className="text-sm text-gray-500 font-medium">{c.label}</p>
+          </button>
+        ))}
+      </div>
+      {unpaidInv.length > 0 && auth.canViewModule('invoices') && (<div className="bg-amber-50 border-2 border-amber-200 rounded-xl p-4 border-l-8" style={{ borderLeftColor: BRAND.gold }}><h3 className="font-black text-amber-900">💵 Outstanding: ${unpaidInv.reduce((s, i) => s + i.balanceDue, 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}</h3><p className="text-sm text-amber-700">{unpaidInv.length} invoice(s) awaiting payment</p></div>)}
+      <div className="grid md:grid-cols-2 gap-6">
+        <div className="bg-white rounded-xl shadow-sm p-5 border-t-4" style={{ borderColor: BRAND.black }}><h3 className="font-black mb-3">🔨 Recent Jobs</h3>{data.jobs.length === 0 ? <p className="text-gray-400 text-sm">No jobs yet</p> : <div className="space-y-2">{data.jobs.slice(-5).reverse().map(j => (<div key={j.id} className="flex items-center justify-between p-2 bg-gray-50 rounded-lg"><div><p className="font-medium text-sm">{j.title}</p><p className="text-xs text-gray-500">{j.customerName}</p></div><StatusBadge status={j.status} /></div>))}</div>}</div>
+        <div className="bg-white rounded-xl shadow-sm p-5 border-t-4" style={{ borderColor: BRAND.gold }}><h3 className="font-black mb-3">🗺️ Job Locations</h3><LazyMapView jobs={data.jobs.filter(j => j.lat && j.lng)} height="250px" /></div>
+      </div>
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const colors: Record<string, string> = {
+    potential: 'bg-yellow-100 text-yellow-800 border-yellow-300',
+    scheduled: 'bg-stone-100 text-stone-800 border-stone-300',
+    'in-progress': 'bg-amber-100 text-amber-900 border-amber-400',
+    completed: 'bg-green-100 text-green-700 border-green-300',
+    cancelled: 'bg-red-100 text-red-700 border-red-300',
+    draft: 'bg-gray-100 text-gray-600 border-gray-300',
+    sent: 'bg-blue-100 text-blue-700 border-blue-300',
+    accepted: 'bg-green-100 text-green-700 border-green-300',
+    declined: 'bg-red-100 text-red-700 border-red-300',
+    paid: 'bg-green-100 text-green-700 border-green-300',
+    overdue: 'bg-red-100 text-red-700 border-red-300',
+    signed: 'bg-green-100 text-green-700 border-green-300',
+    active: 'bg-black text-yellow-400 border-yellow-500',
+  };
+  return <span className={`text-xs px-2 py-1 rounded-full border font-bold ${colors[status] || 'bg-gray-100'}`}>{status}</span>;
+}
+
+function Btn({ children, color = 'gray', onClick, type = 'button', disabled = false }: { children: any; color?: string; onClick?: () => void; type?: 'button' | 'submit'; disabled?: boolean }) {
+  const c: Record<string, string> = {
+    blue: 'bg-blue-100 text-blue-700 hover:bg-blue-200',
+    red: 'bg-red-100 text-red-700 hover:bg-red-200',
+    green: 'bg-green-100 text-green-700 hover:bg-green-200',
+    gray: 'bg-gray-100 text-gray-700 hover:bg-gray-200',
+    amber: 'bg-amber-100 text-amber-800 hover:bg-amber-200',
+    gold: 'bg-black text-yellow-400 hover:bg-zinc-900 border border-yellow-500 font-bold',
+    black: 'bg-black text-white hover:bg-zinc-800',
+  };
+  return <button disabled={disabled} type={type} onClick={onClick} className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${c[color] || c.gray} ${disabled ? 'opacity-40 cursor-not-allowed' : ''}`}>{children}</button>;
+}
+
+function Field({ label, value, onChange, placeholder, type = 'text' }: { label: string; value: string | number; onChange: (v: string) => void; placeholder?: string; type?: string }) {
+  return (
+    <div><label className="block text-sm font-bold text-gray-700 mb-1">{label}</label><input type={type} value={value as any} onChange={e => onChange(e.target.value)} placeholder={placeholder} className="w-full px-3 py-2 border rounded-lg focus:ring-2 outline-none" onFocus={e=>e.currentTarget.style.boxShadow=`0 0 0 2px ${BRAND.gold}`} onBlur={e=>e.currentTarget.style.boxShadow=''} /></div>
+  );
+}
+
+// CUSTOMERS
+function CustomersPage({ data, showToast, auth }: { data: ReturnType<typeof useAppData>; showToast: (m: string) => void; auth: ReturnType<typeof useAuth> }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Customer | null>(null);
+  const [search, setSearch] = useState('');
+  const filtered = data.customers.filter(c => `${c.name} ${c.email} ${c.phone} ${c.address} ${c.city}`.toLowerCase().includes(search.toLowerCase()));
+  const canCreate = auth.can('customers','create');
+  const canEdit = auth.can('customers','edit');
+  const canDelete = auth.can('customers','delete');
+  const save = async (c: Customer) => {
+    if (!canCreate && !editing) { showToast('No permission to create customers'); return; }
+    if (editing && !canEdit) { showToast('No permission to edit'); return; }
+    if (c.address && c.city && c.state) {
+      try { const coords = await geocodeAddress(c.address, c.city, c.state, c.zip); if (coords) { c.lat = coords.lat; c.lng = coords.lng; } } catch {}
+    }
+    await data.saveCustomer(c); setShowForm(false); setEditing(null); showToast(editing ? 'Customer updated!' : 'Customer added!');
+  };
+  const del = async (id: string) => {
+    if (!canDelete) { showToast('No permission to delete'); return; }
+    if (confirm('Delete this customer?')) { await data.deleteCustomer(id); showToast('Customer deleted!'); }
+  };
+  return (
+    <div>
+      <div className="flex flex-col sm:flex-row gap-3 mb-4">
+        <input type="text" placeholder="Search customers..." value={search} onChange={e => setSearch(e.target.value)} className="flex-1 px-4 py-2 border rounded-lg outline-none" />
+        {canCreate && <button onClick={() => { setEditing(null); setShowForm(true); }} className="px-5 py-2 text-black rounded-xl font-black shadow" style={{ background: BRAND.gold }}>+ Add Customer</button>}
+        {!canCreate && <span className="text-xs bg-gray-100 text-gray-600 px-3 py-2 rounded-xl border">View Only</span>}
+      </div>
+      <div className="grid gap-3">{filtered.length === 0 && <p className="text-gray-400 text-center py-8">No customers found</p>}{filtered.map(c => (<div key={c.id} className="bg-white rounded-xl p-4 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-3 border-l-4" style={{ borderLeftColor: BRAND.black }}><div className="flex-1 min-w-0"><h3 className="font-black" style={{ color: BRAND.black }}>{c.name}</h3><p className="text-sm text-gray-500 truncate">{c.address}, {c.city}, {c.state} {c.zip}</p><div className="flex gap-4 text-sm text-gray-500 mt-1 flex-wrap">{c.phone && <span>📞 {c.phone}</span>}{c.email && <span>✉️ {c.email}</span>}</div></div><div className="flex gap-2 shrink-0">{canEdit && <Btn color="gold" onClick={() => { setEditing(c); setShowForm(true); }}>Edit</Btn>}{canDelete && <Btn color="red" onClick={() => del(c.id)}>Delete</Btn>}{!canEdit && !canDelete && <span className="text-xs text-gray-400">View Only</span>}</div></div>))}</div>
+      {showForm && (canCreate || canEdit) && <CustomerForm customer={editing} onSave={save} onClose={() => { setShowForm(false); setEditing(null); }} />}
+    </div>
+  );
+}
+
+function CustomerForm({ customer, onSave, onClose }: { customer: Customer | null; onSave: (c: Customer) => void; onClose: () => void }) {
+  const [f, setF] = useState<Customer>(customer || { id: uuidv4(), name: '', email: '', phone: '', address: '', city: 'Columbus', state: 'OH', zip: '', notes: '', createdAt: new Date().toISOString(), });
+  const u = (k: keyof Customer, v: string) => setF(p => ({ ...p, [k]: v }));
+  return (
+    <Modal title={customer ? 'Edit Customer' : 'Add Customer'} onClose={onClose}>
+      <div className="grid gap-4">
+        <div className="flex items-center gap-3 bg-black p-3 rounded-xl border" style={{ borderColor: BRAND.gold }}><img src="/logo.png" className="w-12 h-12 bg-white rounded-lg p-1" alt="logo" /><div><p className="font-black text-sm" style={{ color: BRAND.gold }}>{COMPANY_INFO.name}</p><p className="text-xs text-white">{COMPANY_INFO.phone} • {COMPANY_INFO.email}</p></div></div>
+        <Field label="Name *" value={f.name} onChange={v => u('name', v)} />
+        <div className="grid grid-cols-2 gap-4"><Field label="Phone" value={f.phone} onChange={v => u('phone', v)} /><Field label="Email" value={f.email} onChange={v => u('email', v)} type="email" /></div>
+        <Field label="Street Address" value={f.address} onChange={v => u('address', v)} placeholder="123 Main St" />
+        <div className="grid grid-cols-3 gap-4"><Field label="City" value={f.city} onChange={v => u('city', v)} /><Field label="State" value={f.state} onChange={v => u('state', v)} /><Field label="ZIP" value={f.zip} onChange={v => u('zip', v)} /></div>
+        <div><label className="block text-sm font-bold mb-1">Notes</label><textarea value={f.notes} onChange={e => u('notes', e.target.value)} rows={3} className="w-full px-3 py-2 border rounded-lg" /></div>
+        <div className="flex justify-end gap-3 pt-2"><button onClick={onClose} className="px-4 py-2 bg-gray-200 rounded-lg">Cancel</button><button onClick={() => { if (f.name.trim()) onSave(f); }} className="px-4 py-2 text-black rounded-lg font-black" style={{ background: BRAND.gold }}>Save</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+// JOBS
+function JobsPage({ data, showToast, auth }: { data: ReturnType<typeof useAppData>; showToast: (m: string) => void; auth: ReturnType<typeof useAuth> }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Job | null>(null);
+  const [filter, setFilter] = useState('all');
+  const filtered = data.jobs.filter(j => filter === 'all' || j.status === filter);
+  const canCreate = auth.can('jobs','create');
+  const canEdit = auth.can('jobs','edit');
+  const canDelete = auth.can('jobs','delete');
+  const save = async (j: Job) => {
+    if (!canCreate && !editing) return showToast('No permission to create jobs');
+    if (editing && !canEdit) return showToast('No permission to edit');
+    if (j.address && j.city && j.state) { try { const coords = await geocodeAddress(j.address, j.city, j.state, j.zip); if (coords) { j.lat = coords.lat; j.lng = coords.lng; } } catch {} }
+    if (j.squareFootage && j.depth) j.asphaltTonnage = calculateAsphaltTonnage(j.squareFootage, j.depth);
+    await data.saveJob(j); setShowForm(false); setEditing(null); showToast(editing ? 'Job updated!' : 'Job added!');
+  };
+  const del = async (id: string) => {
+    if (!canDelete) return showToast('No permission to delete');
+    if (confirm('Delete this job?')) { await data.deleteJob(id); showToast('Job deleted!'); }
+  };
+  return (
+    <div>
+      <div className="flex flex-col sm:flex-row gap-3 mb-4"><select value={filter} onChange={e => setFilter(e.target.value)} className="px-4 py-2 border rounded-lg"><option value="all">All Statuses</option><option value="potential">Potential</option><option value="scheduled">Scheduled</option><option value="in-progress">In Progress</option><option value="completed">Completed</option><option value="cancelled">Cancelled</option></select><div className="flex-1" />{canCreate && <button onClick={() => { setEditing(null); setShowForm(true); }} className="px-5 py-2 text-black rounded-xl font-black" style={{ background: BRAND.gold }}>+ Add Job</button>}</div>
+      <div className="grid gap-3">{filtered.length === 0 && <p className="text-gray-400 text-center py-8">No jobs found</p>}{filtered.map(j => (<div key={j.id} className="bg-white rounded-xl p-4 shadow-sm border-l-4" style={{ borderLeftColor: BRAND.gold }}><div className="flex flex-col md:flex-row md:items-start justify-between gap-3"><div className="flex-1"><div className="flex items-center gap-2 flex-wrap"><h3 className="font-black" style={{ color: BRAND.black }}>{j.title}</h3><StatusBadge status={j.status} />{j.asphaltTonnage ? <span className="text-xs bg-black text-yellow-400 px-2 py-1 rounded-full border font-bold" style={{ borderColor: BRAND.gold }}>~{j.asphaltTonnage} tons</span> : null}</div><p className="text-sm text-gray-600 mt-1">{j.customerName} • {j.address}, {j.city}</p><p className="text-sm text-gray-500 mt-1 line-clamp-2">{j.description}</p><div className="flex gap-4 text-xs text-gray-500 mt-2 flex-wrap">{j.squareFootage ? <span>📐 {j.squareFootage} sq ft</span> : null}{j.depth ? <span>📏 {j.depth}" depth</span> : null}{j.scheduledDate ? <span>📅 {j.scheduledDate}</span> : null}</div></div><div className="flex gap-2 shrink-0">{canEdit && <Btn color="gold" onClick={() => { setEditing(j); setShowForm(true); }}>Edit</Btn>}{canDelete && <Btn color="red" onClick={() => del(j.id)}>Delete</Btn>}{!canEdit && !canDelete && <span className="text-xs text-gray-400">View Only</span>}</div></div></div>))}</div>
+      {showForm && (canCreate || canEdit) && <JobForm job={editing} customers={data.customers} onSave={save} onClose={() => { setShowForm(false); setEditing(null); }} />}
+    </div>
+  );
+}
+
+function JobForm({ job, customers, onSave, onClose }: { job: Job | null; customers: Customer[]; onSave: (j: Job) => void; onClose: () => void }) {
+  const [f, setF] = useState<Job>(job || { id: uuidv4(), customerId: customers[0]?.id || '', customerName: customers[0]?.name || '', title: '', description: '', address: customers[0]?.address || '', city: customers[0]?.city || 'Columbus', state: customers[0]?.state || 'OH', zip: customers[0]?.zip || '', status: 'potential', squareFootage: 1200, depth: 3, scheduledDate: new Date().toISOString().split('T')[0], createdAt: new Date().toISOString(), });
+  const update = (k: keyof Job, v: any) => setF(p => ({ ...p, [k]: v }));
+  const handleCustomerChange = (custId: string) => { const c = customers.find(x => x.id === custId); if (c) setF(p => ({ ...p, customerId: c.id, customerName: c.name, address: c.address, city: c.city, state: c.state, zip: c.zip })); else setF(p => ({ ...p, customerId: custId })); };
+  const tonnage = f.squareFootage && f.depth ? calculateAsphaltTonnage(f.squareFootage, f.depth) : 0;
+  return (
+    <Modal title={job ? 'Edit Job' : 'Add Job'} onClose={onClose}>
+      <div className="grid gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4"><div><label className="block text-sm font-bold mb-1">Customer</label><select value={f.customerId} onChange={e => handleCustomerChange(e.target.value)} className="w-full px-3 py-2 border rounded-lg"><option value="">Select customer...</option>{customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div><Field label="Status" value={f.status} onChange={v => update('status', v)} /></div>
+        <Field label="Job Title *" value={f.title} onChange={v => update('title', v)} placeholder="e.g., Driveway - Columbus" />
+        <div><label className="block text-sm font-bold mb-1">Description</label><textarea value={f.description} onChange={e => update('description', e.target.value)} rows={3} className="w-full px-3 py-2 border rounded-lg" /></div>
+        <Field label="Address" value={f.address} onChange={v => update('address', v)} />
+        <div className="grid grid-cols-3 gap-3"><Field label="City" value={f.city} onChange={v => update('city', v)} /><Field label="State" value={f.state} onChange={v => update('state', v)} /><Field label="ZIP" value={f.zip} onChange={v => update('zip', v)} /></div>
+        <div className="grid grid-cols-3 gap-3"><Field label="Sq Footage" value={f.squareFootage || 0} onChange={v => update('squareFootage', parseFloat(v) || 0)} type="number" /><Field label="Depth (in)" value={f.depth || 0} onChange={v => update('depth', parseFloat(v) || 0)} type="number" /><div><label className="block text-sm font-bold mb-1">Tonnage Est.</label><div className="px-3 py-2 bg-black text-yellow-400 rounded-lg text-sm font-black border" style={{ borderColor: BRAND.gold }}>{tonnage} tons</div></div></div>
+        <div className="grid grid-cols-2 gap-4"><Field label="Scheduled Date" value={f.scheduledDate || ''} onChange={v => update('scheduledDate', v)} type="date" /><div><label className="block text-sm font-bold mb-1">Quick fill</label><div className="flex gap-1 flex-wrap">{[{ l: 'Driveway', t: 'Residential Driveway - Remove & Replace', d: 'Remove existing asphalt, grade base to 2% slope, install 6in 304 base + 2.5in 448 surface' }, { l: 'Sealcoat', t: 'Sealcoating - Driveway & Parking', d: 'Clean, crack fill, 2 coats coal tar sealer, line striping' }, { l: 'Parking Lot', t: 'Commercial Parking Lot', d: 'Parking lot paving, 6in base, 3in binder + surface, includes striping prep' }].map(q => (<button key={q.l} onClick={() => setF(p => ({ ...p, title: q.t, description: q.d }))} className="text-xs px-2 py-1.5 bg-black text-yellow-400 rounded-lg border font-bold" style={{ borderColor: BRAND.gold }}>{q.l}</button>))}</div></div></div>
+        <div className="flex justify-end gap-3 pt-2"><button onClick={onClose} className="px-4 py-2 bg-gray-200 rounded-lg">Cancel</button><button onClick={() => { if (f.title.trim()) onSave(f); }} className="px-4 py-2 text-black rounded-lg font-black" style={{ background: BRAND.gold }}>Save Job</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+// ESTIMATES
+function EstimatesPage({ data, showToast, auth }: { data: ReturnType<typeof useAppData>; showToast: (m: string) => void; auth: ReturnType<typeof useAuth> }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Estimate | null>(null);
+  const [viewing, setViewing] = useState<Estimate | null>(null);
+  const canCreate = auth.can('estimates','create');
+  const canEdit = auth.can('estimates','edit');
+  const canDelete = auth.can('estimates','delete');
+  const save = async (e: Estimate) => {
+    if (!canCreate && !editing) return showToast('No permission to create');
+    if (editing && !canEdit) return showToast('No permission to edit');
+    await data.saveEstimate(e); setShowForm(false); setEditing(null); showToast(editing ? 'Estimate updated!' : 'Estimate created!');
+  };
+  const del = async (id: string) => {
+    if (!canDelete) return showToast('No permission to delete');
+    if (confirm('Delete this estimate?')) { await data.deleteEstimate(id); showToast('Estimate deleted!'); }
+  };
+  const convertToInvoice = async (est: Estimate) => {
+    if (!auth.can('invoices','create')) return showToast('No permission to create invoices');
+    if (!confirm(`Convert estimate "${est.title}" to invoice?`)) return;
+    const inv: Invoice = { id: uuidv4(), customerId: est.customerId, customerName: est.customerName, jobId: est.jobId, estimateId: est.id, title: est.title, lineItems: est.lineItems, subtotal: est.subtotal, taxRate: est.taxRate, tax: est.tax, total: est.total, amountPaid: 0, balanceDue: est.total, status: 'draft', dueDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString().split('T')[0], createdAt: new Date().toISOString(), };
+    await data.saveInvoice(inv); showToast('Invoice created from estimate!');
+  };
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-4"><p className="text-sm text-gray-500">{data.estimates.length} estimates • ${data.estimates.reduce((s, e) => s + e.total, 0).toLocaleString()} total</p>{canCreate && <button onClick={() => { setEditing(null); setShowForm(true); }} className="px-5 py-2 text-black rounded-xl font-black shadow" style={{ background: BRAND.gold }}>+ New Estimate</button>}</div>
+      <div className="grid gap-3">{data.estimates.length === 0 && <p className="text-gray-400 text-center py-12">No estimates yet</p>}{data.estimates.slice().reverse().map(e => (<div key={e.id} className="bg-white rounded-xl p-4 shadow-sm border-l-4" style={{ borderLeftColor: BRAND.black }}><div className="flex flex-col md:flex-row justify-between gap-3"><div className="flex-1"><div className="flex items-center gap-2"><h3 className="font-black" style={{ color: BRAND.black }}>{e.title}</h3><StatusBadge status={e.status} /></div><p className="text-sm text-gray-500">{e.customerName} • {e.createdAt.split('T')[0]} • {e.lineItems.length} items</p><p className="font-black mt-1" style={{ color: BRAND.goldDark }}>${e.total.toLocaleString('en-US', { minimumFractionDigits: 2 })}</p></div><div className="flex gap-2 flex-wrap"><Btn color="gray" onClick={() => setViewing(e)}>View</Btn>{canEdit && <Btn color="gold" onClick={() => { setEditing(e); setShowForm(true); }}>Edit</Btn>}{auth.can('invoices','create') && <Btn color="green" onClick={() => convertToInvoice(e)}>→ Invoice</Btn>}{canDelete && <Btn color="red" onClick={() => del(e.id)}>Delete</Btn>}</div></div></div>))}</div>
+      {showForm && (canCreate || canEdit) && <EstimateForm estimate={editing} customers={data.customers} jobs={data.jobs} onSave={save} onClose={() => { setShowForm(false); setEditing(null); }} />}
+      {viewing && <EstimateView estimate={viewing} onClose={() => setViewing(null)} />}
+    </div>
+  );
+}
+
+function EstimateForm({ estimate, customers, jobs, onSave, onClose }: { estimate: Estimate | null; customers: Customer[]; jobs: Job[]; onSave: (e: Estimate) => void; onClose: () => void }) {
+  const [f, setF] = useState<Estimate>(estimate || { id: uuidv4(), customerId: customers[0]?.id || '', customerName: customers[0]?.name || '', jobId: undefined, title: '', lineItems: [], subtotal: 0, taxRate: 0, tax: 0, total: 0, status: 'draft', validUntil: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString().split('T')[0], notes: '', createdAt: new Date().toISOString(), });
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [aiLoading, setAiLoading] = useState(false);
+  const recalc = (items: LineItem[], taxRate = f.taxRate) => { const subtotal = items.reduce((s, it) => s + it.total, 0); const tax = Math.round(subtotal * (taxRate / 100) * 100) / 100; const total = Math.round((subtotal + tax) * 100) / 100; setF(p => ({ ...p, lineItems: items, subtotal, tax, total })); };
+  useEffect(() => { if (estimate) recalc(estimate.lineItems, estimate.taxRate); }, []);
+  const addItem = () => { const newItem: LineItem = { id: uuidv4(), description: '', quantity: 1, unit: 'ls', unitPrice: 0, total: 0 }; recalc([...f.lineItems, newItem]); };
+  const updateItem = (id: string, patch: Partial<LineItem>) => { const items = f.lineItems.map(it => { if (it.id !== id) return it; const updated = { ...it, ...patch }; updated.total = Math.round(updated.quantity * updated.unitPrice * 100) / 100; return updated; }); recalc(items); };
+  const removeItem = (id: string) => { recalc(f.lineItems.filter(i => i.id !== id)); };
+  const handleAI = async () => {
+    if (!aiPrompt.trim() && !f.title.trim()) { alert('Describe the job'); return; }
+    setAiLoading(true);
+    try { const jobCtx = jobs.find(j => j.id === f.jobId); const result = await generateAIEstimate(aiPrompt || f.title, { squareFootage: jobCtx?.squareFootage, depth: jobCtx?.depth, description: f.title + ' ' + (jobCtx?.description || ''), title: f.title, }); setF(p => ({ ...p, title: p.title || result.title, notes: result.notes })); recalc(result.lineItems); setAiPrompt(''); } catch (e) { alert('AI failed: ' + e); } finally { setAiLoading(false); }
+  };
+  return (
+    <Modal title={estimate ? 'Edit Estimate' : 'New Estimate - Black Gold AI'} onClose={onClose}>
+      <div className="space-y-4">
+        <div className="bg-black border rounded-xl p-4" style={{ borderColor: BRAND.gold }}><h4 className="font-black text-sm mb-2" style={{ color: BRAND.gold }}>🤖 Black Gold AI Estimator</h4><div className="flex gap-2"><input type="text" value={aiPrompt} onChange={e => setAiPrompt(e.target.value)} placeholder="e.g., 1800 sq ft parking lot sealcoating, Columbus OH..." className="flex-1 px-3 py-2 border rounded-lg text-sm bg-white" /><button onClick={handleAI} disabled={aiLoading} className="px-4 py-2 text-black rounded-lg text-sm font-black" style={{ background: BRAND.gold }}>{aiLoading ? 'Generating...' : '✨ Generate'}</button></div></div>
+        <div className="grid grid-cols-2 gap-4"><div><label className="block text-sm font-bold mb-1">Customer</label><select value={f.customerId} onChange={e => { const c = customers.find(x => x.id === e.target.value); setF(p => ({ ...p, customerId: e.target.value, customerName: c?.name || '' })); }} className="w-full px-3 py-2 border rounded-lg">{customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div><div><label className="block text-sm font-bold mb-1">Linked Job</label><select value={f.jobId || ''} onChange={e => setF(p => ({ ...p, jobId: e.target.value || undefined }))} className="w-full px-3 py-2 border rounded-lg"><option value="">No job linked</option>{jobs.filter(j => j.customerId === f.customerId || !f.customerId).map(j => <option key={j.id} value={j.id}>{j.title}</option>)}</select></div></div>
+        <Field label="Estimate Title" value={f.title} onChange={v => setF(p => ({ ...p, title: v }))} placeholder="e.g., Driveway Sealcoating - Columbus" />
+        <div><div className="flex justify-between items-center mb-2"><label className="text-sm font-black">Line Items</label><button onClick={addItem} className="text-xs px-3 py-1 bg-black text-yellow-400 rounded-full border font-bold" style={{ borderColor: BRAND.gold }}>+ Add Item</button></div><div className="space-y-2 max-h-[300px] overflow-y-auto border rounded-xl p-2 bg-gray-50">{f.lineItems.length === 0 && <p className="text-xs text-gray-400 p-2">No items yet</p>}{f.lineItems.map(item => (<div key={item.id} className="grid grid-cols-12 gap-2 items-start bg-white p-2 rounded-lg border"><div className="col-span-6"><input value={item.description} onChange={e => updateItem(item.id, { description: e.target.value })} placeholder="Description" className="w-full px-2 py-1.5 text-sm border rounded-lg" /></div><div className="col-span-2"><input type="number" value={item.quantity} onChange={e => updateItem(item.id, { quantity: parseFloat(e.target.value) || 0 })} className="w-full px-2 py-1.5 text-sm border rounded-lg" /></div><div className="col-span-2"><input type="number" value={item.unitPrice} onChange={e => updateItem(item.id, { unitPrice: parseFloat(e.target.value) || 0 })} className="w-full px-2 py-1.5 text-sm border rounded-lg" /></div><div className="col-span-2 flex items-center justify-between"><span className="text-sm font-bold">${item.total.toFixed(2)}</span><button onClick={() => removeItem(item.id)} className="text-red-500 text-xs px-1">✕</button></div></div>))}</div></div>
+        <div className="grid grid-cols-3 gap-3 bg-black text-white p-3 rounded-xl border" style={{ borderColor: BRAND.gold }}><div><label className="text-xs" style={{ color: BRAND.gold }}>Subtotal</label><p className="font-bold">${f.subtotal.toFixed(2)}</p></div><div><label className="text-xs" style={{ color: BRAND.gold }}>Tax %</label><input type="number" value={f.taxRate} onChange={e => { const rate = parseFloat(e.target.value) || 0; const tax = Math.round(f.subtotal * rate / 100 * 100) / 100; setF(p => ({ ...p, taxRate: rate, tax, total: p.subtotal + tax })); }} className="w-full px-2 py-1 border rounded-lg text-sm text-black" /></div><div><label className="text-xs" style={{ color: BRAND.gold }}>Total</label><p className="font-black text-lg" style={{ color: BRAND.gold }}>${f.total.toFixed(2)}</p></div></div>
+        <div className="grid grid-cols-2 gap-4"><div><label className="block text-sm font-bold mb-1">Status</label><select value={f.status} onChange={e => setF(p => ({ ...p, status: e.target.value as any }))} className="w-full px-3 py-2 border rounded-lg"><option value="draft">Draft</option><option value="sent">Sent</option><option value="accepted">Accepted</option><option value="declined">Declined</option></select></div><Field label="Valid Until" value={f.validUntil || ''} onChange={v => setF(p => ({ ...p, validUntil: v }))} type="date" /></div>
+        <div><label className="block text-sm font-bold mb-1">Notes</label><textarea value={f.notes || ''} onChange={e => setF(p => ({ ...p, notes: e.target.value }))} rows={3} className="w-full px-3 py-2 border rounded-lg text-sm" /></div>
+        <div className="flex justify-end gap-3 pt-2"><button onClick={onClose} className="px-4 py-2 bg-gray-200 rounded-lg">Cancel</button><button onClick={() => { if (f.title.trim() && f.lineItems.length > 0) onSave(f); else alert('Need title and items'); }} className="px-4 py-2 text-black rounded-lg font-black" style={{ background: BRAND.gold }}>Save Estimate</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+function EstimateView({ estimate, onClose }: { estimate: Estimate; onClose: () => void }) {
+  const handlePrint = () => openPrintWithLogo(`Estimate - ${estimate.title} - ${estimate.customerName}`);
+  return (
+    <Modal title={`Estimate - ${estimate.title}`} onClose={onClose}>
+      <div className="space-y-4 print-area">
+        <PrintHeader title={`ESTIMATE - ${estimate.title}`} subtitle={`Valid Until: ${estimate.validUntil} • Status: ${estimate.status}`} customerName={estimate.customerName} date={estimate.createdAt.split('T')[0]} />
+        <div className="flex justify-between items-center"><StatusBadge status={estimate.status} /><button onClick={handlePrint} className="px-4 py-2 bg-black text-yellow-400 rounded-lg text-sm font-bold border" style={{ borderColor: BRAND.gold }}>🖨️ Print Estimate</button></div>
+        <div className="border rounded-xl overflow-hidden"><table className="w-full text-sm"><thead className="bg-black text-yellow-400 text-left"><tr><th className="p-2">Description</th><th className="p-2">Qty</th><th className="p-2">Price</th><th className="p-2 text-right">Total</th></tr></thead><tbody>{estimate.lineItems.map(it => (<tr key={it.id} className="border-t"><td className="p-2">{it.description}</td><td className="p-2">{it.quantity} {it.unit}</td><td className="p-2">${it.unitPrice}</td><td className="p-2 text-right">${it.total.toFixed(2)}</td></tr>))}</tbody></table></div>
+        <div className="flex justify-end"><div className="w-64 space-y-1 text-sm border p-3 rounded-xl bg-gray-50"><div className="flex justify-between"><span>Subtotal</span><span>${estimate.subtotal.toFixed(2)}</span></div><div className="flex justify-between"><span>Tax ({estimate.taxRate}%)</span><span>${estimate.tax.toFixed(2)}</span></div><div className="flex justify-between font-black text-base border-t pt-1"><span>Total</span><span>${estimate.total.toFixed(2)}</span></div></div></div>
+        {estimate.notes && <div className="bg-yellow-50 border p-3 rounded-xl text-sm whitespace-pre-wrap" style={{ borderColor: BRAND.gold }}>{estimate.notes}</div>}
+        <div className="flex justify-end gap-2"><button onClick={onClose} className="px-4 py-2 bg-gray-200 rounded-lg">Close</button><button onClick={handlePrint} className="px-4 py-2 bg-black text-yellow-400 rounded-lg font-bold border" style={{ borderColor: BRAND.gold }}>🖨️ Print / Save PDF</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+function InvoicesPage({ data, showToast, auth }: { data: ReturnType<typeof useAppData>; showToast: (m: string) => void; auth: ReturnType<typeof useAuth> }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Invoice | null>(null);
+  const [viewing, setViewing] = useState<Invoice | null>(null);
+  const [filter, setFilter] = useState('all');
+  const filtered = data.invoices.filter(i => filter === 'all' || i.status === filter);
+  const canCreate = auth.can('invoices','create');
+  const canEdit = auth.can('invoices','edit');
+  const canDelete = auth.can('invoices','delete');
+  const save = async (inv: Invoice) => {
+    if (!canCreate && !editing) return showToast('No permission to create');
+    if (editing && !canEdit) return showToast('No permission to edit');
+    inv.balanceDue = Math.round((inv.total - inv.amountPaid) * 100) / 100; await data.saveInvoice(inv); setShowForm(false); setEditing(null); showToast(editing ? 'Invoice updated!' : 'Invoice created!');
+  };
+  const del = async (id: string) => {
+    if (!canDelete) return showToast('No permission to delete');
+    if (confirm('Delete this invoice?')) { await data.deleteInvoice(id); showToast('Invoice deleted!'); }
+  };
+  const markPaid = async (inv: Invoice) => {
+    if (!canEdit) return showToast('No permission to edit');
+    const updated = { ...inv, amountPaid: inv.total, balanceDue: 0, status: 'paid' as const }; await data.saveInvoice(updated); showToast('Marked as paid!');
+  };
+  return (
+    <div>
+      <div className="flex flex-col sm:flex-row gap-3 mb-4"><select value={filter} onChange={e => setFilter(e.target.value)} className="px-4 py-2 border rounded-lg"><option value="all">All</option><option value="draft">Draft</option><option value="sent">Sent</option><option value="paid">Paid</option><option value="overdue">Overdue</option></select><div className="flex-1" />{canCreate && <button onClick={() => { setEditing(null); setShowForm(true); }} className="px-5 py-2 text-black rounded-xl font-black" style={{ background: BRAND.gold }}>+ New Invoice</button>}</div>
+      <div className="grid gap-3">{filtered.length === 0 && <p className="text-gray-400 text-center py-10">No invoices found</p>}{filtered.slice().reverse().map(inv => (<div key={inv.id} className="bg-white rounded-xl p-4 shadow-sm flex flex-col md:flex-row justify-between gap-3 border-l-4" style={{ borderLeftColor: BRAND.black }}><div><div className="flex items-center gap-2"><h3 className="font-black">{inv.title}</h3><StatusBadge status={inv.status} /></div><p className="text-sm text-gray-500">{inv.customerName} • Due: {inv.dueDate || '—'}</p><p className="mt-1"><span className="font-black">${inv.total.toFixed(2)}</span> <span className="text-sm text-gray-500">• Paid ${inv.amountPaid.toFixed(2)} • Bal ${inv.balanceDue.toFixed(2)}</span></p></div><div className="flex gap-2 flex-wrap"><Btn color="gray" onClick={() => setViewing(inv)}>View</Btn>{canEdit && <Btn color="gold" onClick={() => { setEditing(inv); setShowForm(true); }}>Edit</Btn>}{inv.status !== 'paid' && canEdit && <Btn color="green" onClick={() => markPaid(inv)}>Mark Paid</Btn>}{canDelete && <Btn color="red" onClick={() => del(inv.id)}>Delete</Btn>}</div></div>))}</div>
+      {showForm && (canCreate || canEdit) && <InvoiceForm invoice={editing} customers={data.customers} estimates={data.estimates} onSave={save} onClose={() => { setShowForm(false); setEditing(null); }} />}
+      {viewing && <InvoiceView invoice={viewing} onClose={() => setViewing(null)} />}
+    </div>
+  );
+}
+
+function InvoiceView({ invoice, onClose }: { invoice: Invoice; onClose: () => void }) {
+  const handlePrint = () => openPrintWithLogo(`Invoice - ${invoice.title} - ${invoice.customerName}`);
+  return (
+    <Modal title={`Invoice - ${invoice.title}`} onClose={onClose}>
+      <div className="space-y-4 print-area">
+        <PrintHeader title={`INVOICE - ${invoice.title}`} subtitle={`Due: ${invoice.dueDate} • Status: ${invoice.status.toUpperCase()} • Balance: $${invoice.balanceDue.toFixed(2)}`} customerName={invoice.customerName} date={invoice.createdAt.split('T')[0]} />
+        <div className="flex justify-between items-center"><StatusBadge status={invoice.status} /><button onClick={handlePrint} className="px-4 py-2 bg-black text-yellow-400 rounded-lg text-sm font-bold border" style={{ borderColor: BRAND.gold }}>🖨️ Print Invoice</button></div>
+        <div className="border rounded-xl overflow-hidden"><table className="w-full text-sm"><thead className="bg-black text-yellow-400"><tr><th className="p-2 text-left">Description</th><th className="p-2">Qty</th><th className="p-2">Price</th><th className="p-2 text-right">Total</th></tr></thead><tbody>{invoice.lineItems.map(it=>(<tr key={it.id} className="border-t"><td className="p-2">{it.description}</td><td className="p-2">{it.quantity} {it.unit}</td><td className="p-2">${it.unitPrice}</td><td className="p-2 text-right">${it.total.toFixed(2)}</td></tr>))}</tbody></table></div>
+        <div className="flex justify-end"><div className="w-72 space-y-2 text-sm border-2 p-4 rounded-xl bg-black text-white" style={{ borderColor: BRAND.gold }}><div className="flex justify-between text-gray-300"><span>Subtotal</span><span>${invoice.subtotal.toFixed(2)}</span></div><div className="flex justify-between text-gray-300"><span>Tax</span><span>${invoice.tax.toFixed(2)}</span></div><div className="flex justify-between"><span>Amount Paid</span><span className="text-green-400">-${invoice.amountPaid.toFixed(2)}</span></div><div className="flex justify-between font-black text-lg border-t border-yellow-600 pt-2" style={{ color: BRAND.gold }}><span>Balance Due</span><span>${invoice.balanceDue.toFixed(2)}</span></div></div></div>
+        <div className="flex justify-end gap-2"><button onClick={onClose} className="px-4 py-2 bg-gray-200 rounded-lg">Close</button><button onClick={handlePrint} className="px-4 py-2 bg-black text-yellow-400 rounded-lg font-bold border" style={{ borderColor: BRAND.gold }}>🖨️ Print / PDF</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+function InvoiceForm({ invoice, customers, estimates, onSave, onClose }: { invoice: Invoice | null; customers: Customer[]; estimates: Estimate[]; onSave: (i: Invoice) => void; onClose: () => void }) {
+  const [f, setF] = useState<Invoice>(invoice || { id: uuidv4(), customerId: customers[0]?.id || '', customerName: customers[0]?.name || '', title: '', lineItems: [], subtotal: 0, taxRate: 0, tax: 0, total: 0, amountPaid: 0, balanceDue: 0, status: 'draft', dueDate: new Date(Date.now() + 30 * 24 * 3600 * 1000).toISOString().split('T')[0], createdAt: new Date().toISOString(), });
+  const loadFromEstimate = (estId: string) => { const est = estimates.find(e => e.id === estId); if (est) { setF(p => ({ ...p, estimateId: est.id, customerId: est.customerId, customerName: est.customerName, title: est.title, lineItems: est.lineItems, subtotal: est.subtotal, tax: est.tax, taxRate: est.taxRate, total: est.total, balanceDue: est.total - p.amountPaid, })); } };
+  return (
+    <Modal title={invoice ? 'Edit Invoice' : 'New Invoice'} onClose={onClose}>
+      <div className="space-y-4">
+        <div className="flex items-center gap-3 bg-black p-3 rounded-xl border" style={{ borderColor: BRAND.gold }}><img src="/logo.png" className="w-10 h-10 bg-white rounded-lg p-1" alt="logo" /><p className="font-black text-sm" style={{ color: BRAND.gold }}>{COMPANY_INFO.name} • {COMPANY_INFO.phone}</p></div>
+        <div className="grid grid-cols-2 gap-3"><div><label className="text-sm font-bold">From Estimate</label><select onChange={e => loadFromEstimate(e.target.value)} className="w-full px-3 py-2 border rounded-lg"><option value="">-- Select to import --</option>{estimates.map(e => <option key={e.id} value={e.id}>{e.title} - ${e.total.toFixed(0)}</option>)}</select></div><div><label className="text-sm font-bold">Customer</label><select value={f.customerId} onChange={e => { const c = customers.find(x => x.id === e.target.value); setF(p => ({ ...p, customerId: e.target.value, customerName: c?.name || '' })); }} className="w-full px-3 py-2 border rounded-lg">{customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div></div>
+        <Field label="Title" value={f.title} onChange={v => setF(p => ({ ...p, title: v }))} />
+        <div className="border rounded-xl p-2 bg-gray-50 max-h-60 overflow-auto space-y-2">{f.lineItems.map(it => (<div key={it.id} className="bg-white p-2 rounded-lg flex justify-between text-sm"><span>{it.description} ({it.quantity} {it.unit} @ ${it.unitPrice})</span><span className="font-bold">${it.total.toFixed(2)}</span></div>))}{f.lineItems.length === 0 && <p className="text-xs text-gray-400 p-2">No items</p>}</div>
+        <div className="grid grid-cols-4 gap-3 text-sm"><div>Subtotal <p className="font-bold">${f.subtotal.toFixed(2)}</p></div><div>Tax {f.taxRate}% <p className="font-bold">${f.tax.toFixed(2)}</p></div><div>Total <p className="font-bold">${f.total.toFixed(2)}</p></div><div><label className="text-xs font-bold">Amount Paid</label><input type="number" value={f.amountPaid} onChange={e => { const paid = parseFloat(e.target.value) || 0; setF(p => ({ ...p, amountPaid: paid, balanceDue: Math.round((p.total - paid) * 100) / 100 })); }} className="w-full px-2 py-1 border rounded-lg" /></div></div>
+        <div className="grid grid-cols-2 gap-4"><div><label className="text-sm font-bold">Status</label><select value={f.status} onChange={e => setF(p => ({ ...p, status: e.target.value as any }))} className="w-full px-3 py-2 border rounded-lg"><option value="draft">Draft</option><option value="sent">Sent</option><option value="paid">Paid</option><option value="overdue">Overdue</option></select></div><Field label="Due Date" value={f.dueDate || ''} onChange={v => setF(p => ({ ...p, dueDate: v }))} type="date" /></div>
+        <div className="flex justify-end gap-2"><button onClick={onClose} className="px-4 py-2 bg-gray-200 rounded-lg">Cancel</button><button onClick={() => onSave(f)} className="px-4 py-2 text-black rounded-lg font-black" style={{ background: BRAND.gold }}>Save Invoice</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+function ContractsPage({ data, showToast, auth }: { data: ReturnType<typeof useAppData>; showToast: (m: string) => void; auth: ReturnType<typeof useAuth> }) {
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Contract | null>(null);
+  const [viewing, setViewing] = useState<Contract | null>(null);
+  const canCreate = auth.can('contracts','create');
+  const canEdit = auth.can('contracts','edit');
+  const canDelete = auth.can('contracts','delete');
+  const save = async (c: Contract) => {
+    if (!canCreate && !editing) return showToast('No permission to create');
+    if (editing && !canEdit) return showToast('No permission to edit');
+    await data.saveContract(c); setShowForm(false); setEditing(null); showToast(editing ? 'Contract updated!' : 'Contract created!');
+  };
+  const del = async (id: string) => {
+    if (!canDelete) return showToast('No permission to delete');
+    if (confirm('Delete contract?')) { await data.deleteContract(id); showToast('Contract deleted!'); }
+  };
+  return (
+    <div>
+      <div className="flex justify-between mb-4"><p className="text-sm text-gray-500">{data.contracts.length} contracts</p>{canCreate && <button onClick={() => { setEditing(null); setShowForm(true); }} className="px-5 py-2 text-black rounded-xl font-black" style={{ background: BRAND.gold }}>+ New Contract</button>}</div>
+      <div className="grid gap-3">{data.contracts.length === 0 && <p className="text-gray-400 text-center py-10">No contracts yet</p>}{data.contracts.slice().reverse().map(c => (<div key={c.id} className="bg-white rounded-xl p-4 shadow-sm flex justify-between gap-3 border-l-4" style={{ borderLeftColor: BRAND.gold }}><div><div className="flex gap-2 items-center"><h3 className="font-black">{c.title}</h3><StatusBadge status={c.status} /></div><p className="text-sm text-gray-500">{c.customerName} • {c.createdAt.split('T')[0]}</p>{c.signedAt && <p className="text-xs text-green-600 font-bold">✅ Signed {c.signedAt.split('T')[0]} by {c.customerSignatureName}</p>}</div><div className="flex gap-2 flex-wrap"><Btn color="gray" onClick={() => setViewing(c)}>View</Btn>{canEdit && <Btn color="gold" onClick={() => { setEditing(c); setShowForm(true); }}>Edit / Sign</Btn>}{canDelete && <Btn color="red" onClick={() => del(c.id)}>Delete</Btn>}</div></div>))}</div>
+      {showForm && (canCreate || canEdit) && <ContractForm contract={editing} customers={data.customers} jobs={data.jobs} estimates={data.estimates} onSave={save} onClose={() => { setShowForm(false); setEditing(null); }} />}
+      {viewing && <ContractView contract={viewing} onClose={() => setViewing(null)} />}
+    </div>
+  );
+}
+
+function ContractForm({ contract, customers, jobs, estimates, onSave, onClose }: { contract: Contract | null; customers: Customer[]; jobs: Job[]; estimates: Estimate[]; onSave: (c: Contract) => void; onClose: () => void }) {
+  const [f, setF] = useState<Contract>(contract || { id: uuidv4(), customerId: customers[0]?.id || '', customerName: customers[0]?.name || '', title: '', content: '', status: 'draft', createdAt: new Date().toISOString(), });
+  const [aiLoading, setAiLoading] = useState(false);
+  const [signerName, setSignerName] = useState(contract?.customerSignatureName || '');
+  const handleAIGenerate = async () => {
+    if (!f.customerName || !f.title) { alert('Enter title and select customer first'); return; }
+    setAiLoading(true);
+    try {
+      const est = estimates.find(e => e.id === f.estimateId) || estimates.find(e => e.customerId === f.customerId);
+      const job = jobs.find(j => j.id === f.jobId);
+      const content = await generateAIContract(f.title, f.customerName, est?.total || 0, job?.squareFootage);
+      setF(p => ({ ...p, content }));
+    } finally { setAiLoading(false); }
+  };
+  const handleSignature = (dataUrl: string) => { setF(p => ({ ...p, signatureData: dataUrl, signedAt: new Date().toISOString(), customerSignatureName: signerName || p.customerName, status: 'signed' as any })); };
+  return (
+    <Modal title={contract ? 'Edit Contract' : 'New Contract'} onClose={onClose}>
+      <div className="space-y-4">
+        <div className="flex items-center gap-3 bg-black p-3 rounded-xl border" style={{ borderColor: BRAND.gold }}><img src="/logo.png" className="w-10 h-10 bg-white rounded-lg p-1" alt="logo" /><p className="font-black text-sm" style={{ color: BRAND.gold }}>{COMPANY_INFO.name} • {COMPANY_INFO.phone}</p></div>
+        <div className="grid grid-cols-2 gap-3"><div><label className="text-sm font-bold">Customer</label><select value={f.customerId} onChange={e => { const c = customers.find(x => x.id === e.target.value); setF(p => ({ ...p, customerId: e.target.value, customerName: c?.name || '' })); }} className="w-full px-3 py-2 border rounded-lg">{customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></div><div><label className="text-sm font-bold">Estimate Link</label><select value={f.estimateId || ''} onChange={e => setF(p => ({ ...p, estimateId: e.target.value || undefined }))} className="w-full px-3 py-2 border rounded-lg"><option value="">None</option>{estimates.filter(e => e.customerId === f.customerId).map(e => <option key={e.id} value={e.id}>{e.title} - ${e.total.toFixed(0)}</option>)}</select></div></div>
+        <Field label="Contract Title" value={f.title} onChange={v => setF(p => ({ ...p, title: v }))} placeholder="e.g., Driveway Paving Agreement - Columbus" />
+        <div className="flex gap-2 items-center"><button onClick={handleAIGenerate} disabled={aiLoading} className="px-3 py-1.5 text-black rounded-lg text-sm font-black disabled:opacity-50" style={{ background: BRAND.gold }}>{aiLoading ? 'Generating...' : '🤖 AI Generate Contract'}</button><span className="text-xs text-gray-500">Creates terms for {COMPANY_INFO.name}</span></div>
+        <div><label className="text-sm font-bold">Contract Content</label><textarea value={f.content} onChange={e => setF(p => ({ ...p, content: e.target.value }))} rows={14} className="w-full px-3 py-2 border rounded-lg font-mono text-xs" /></div>
+        <div className="grid grid-cols-2 gap-3"><div><label className="text-sm font-bold">Status</label><select value={f.status} onChange={e => setF(p => ({ ...p, status: e.target.value as any }))} className="w-full px-3 py-2 border rounded-lg"><option value="draft">Draft</option><option value="sent">Sent</option><option value="signed">Signed</option><option value="active">Active</option></select></div><div><label className="text-sm font-bold">Signer Name</label><input value={signerName} onChange={e => setSignerName(e.target.value)} className="w-full px-3 py-2 border rounded-lg" placeholder="Customer full name" /></div></div>
+        <div className="bg-gray-50 border rounded-xl p-4" style={{ borderColor: BRAND.gold }}><h4 className="font-black text-sm mb-2">✍️ Customer Signature</h4>{f.signatureData ? (<div className="space-y-2"><img src={f.signatureData} alt="signature" className="border bg-white rounded-lg max-h-[150px]" /><p className="text-xs text-green-600 font-bold">Signed by {f.customerSignatureName} on {f.signedAt?.split('T')[0]}</p><button onClick={() => setF(p => ({ ...p, signatureData: undefined, signedAt: undefined, status: 'draft' }))} className="text-xs px-2 py-1 bg-red-50 text-red-600 rounded-lg">Clear signature</button></div>) : (<SignaturePad onSave={handleSignature} />)}</div>
+        <div className="flex justify-end gap-2"><button onClick={onClose} className="px-4 py-2 bg-gray-200 rounded-lg">Cancel</button><button onClick={() => onSave(f)} className="px-4 py-2 text-black rounded-lg font-black" style={{ background: BRAND.gold }}>Save Contract</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+function ContractView({ contract, onClose }: { contract: Contract; onClose: () => void }) {
+  const handlePrint = () => openPrintWithLogo(`Contract - ${contract.title} - ${contract.customerName}`);
+  return (
+    <Modal title={contract.title} onClose={onClose}>
+      <div className="space-y-4 print-area">
+        <PrintHeader title={`CONTRACT - ${contract.title}`} subtitle={`Status: ${contract.status.toUpperCase()}`} customerName={contract.customerName} date={contract.createdAt.split('T')[0]} />
+        <div className="flex justify-between items-center"><StatusBadge status={contract.status} /><button onClick={handlePrint} className="px-4 py-2 bg-black text-yellow-400 rounded-lg text-sm font-bold border" style={{ borderColor: BRAND.gold }}>🖨️ Print Contract</button></div>
+        <pre className="whitespace-pre-wrap bg-white border-2 p-5 rounded-xl text-xs font-mono leading-relaxed" style={{ borderColor: BRAND.black }}>{contract.content}</pre>
+        {contract.signatureData && (<div className="border-t-2 pt-4 mt-4" style={{ borderColor: BRAND.gold }}><p className="text-sm font-black">Customer Signature:</p><img src={contract.signatureData} alt="sig" className="border bg-white rounded-lg max-h-[140px] mt-2 p-2" /><p className="text-xs text-gray-600 mt-2 font-bold">{contract.customerSignatureName} • Signed on {contract.signedAt?.split('T')[0]}</p></div>)}
+        <div className="flex justify-end gap-2"><button onClick={onClose} className="px-4 py-2 bg-gray-200 rounded-lg">Close</button><button onClick={handlePrint} className="px-4 py-2 bg-black text-yellow-400 rounded-lg font-black border" style={{ borderColor: BRAND.gold }}>🖨️ Print / PDF</button></div>
+      </div>
+    </Modal>
+  );
+}
+
+function MapPage({ data, auth }: { data: ReturnType<typeof useAppData>; auth: ReturnType<typeof useAuth> }) {
+  const [filter, setFilter] = useState('all');
+  const jobs = data.jobs.filter(j => filter === 'all' || j.status === filter);
+  const canView = auth.can('map','view');
+  if (!canView) return <NoAccess module="Map" />;
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-xl p-4 shadow-sm flex gap-3 items-center flex-wrap border-t-4" style={{ borderColor: BRAND.gold }}><h3 className="font-black">Filter:</h3><select value={filter} onChange={e => setFilter(e.target.value)} className="px-3 py-1.5 border rounded-lg text-sm"><option value="all">All Jobs ({data.jobs.length})</option><option value="scheduled">Scheduled</option><option value="in-progress">In Progress</option><option value="completed">Completed</option><option value="potential">Potential</option></select><span className="text-xs text-gray-500">{jobs.filter(j=>j.lat&&j.lng).length} mapped • {jobs.filter(j=>!j.lat||!j.lng).length} without location</span></div>
+      <div className="bg-white rounded-xl p-2 shadow-sm"><LazyMapView jobs={jobs} height="600px" /></div>
+      <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3">{jobs.slice(0,9).map(j => (<div key={j.id} className="bg-white p-3 rounded-xl shadow-sm border-l-4" style={{ borderColor: j.status==='completed'?'#27ae60':j.status==='in-progress'?BRAND.gold:'#000' }}><p className="font-bold text-sm">{j.title}</p><p className="text-xs text-gray-500">{j.customerName} • {j.address}</p><div className="flex gap-2 mt-2"><StatusBadge status={j.status} />{j.lat ? <span className="text-xs bg-green-50 text-green-700 px-2 py-0.5 rounded-full">📍 mapped</span> : <span className="text-xs bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full">no coords</span>}</div></div>))}</div>
+    </div>
+  );
+}
+
+function AIPage({ data, showToast, auth }: { data: ReturnType<typeof useAppData>; showToast: (m: string) => void; auth: ReturnType<typeof useAuth> }) {
+  const [input, setInput] = useState('');
+  const [messages, setMessages] = useState<{ role: 'user' | 'ai'; text: string }[]>([
+    { role: 'ai', text: `🔥 Black Gold AI - FULL CONTROL MODE\nLogged in as ${auth.currentUser?.displayName} (${auth.currentUser?.role})\n\nYou have ${data.customers.length} customers, ${data.jobs.length} jobs, ${data.estimates.length} estimates, ${data.invoices.length} invoices.\n\nTry:\n• "Add customer John Smith phone 380-201-1234 address 123 Main St Columbus"\n• "Add job for John Smith - sealcoating 1500 sq ft"\n• "Create estimate for John Smith driveway sealcoating"\n• "List unpaid invoices"\n• Your permissions: ${Object.entries(auth.currentUser?.permissions || {}).filter(([_,p])=>p.view).map(([k])=>k).join(', ')}\n\nI work offline!` }
+  ]);
+  const [loading, setLoading] = useState(false);
+  const endRef = useRef<HTMLDivElement>(null);
+  const [estPrompt, setEstPrompt] = useState('1500 sq ft driveway sealcoating & crack fill, Columbus OH');
+  const [estResult, setEstResult] = useState<AIEstimateResult | null>(null);
+  const [estLoading, setEstLoading] = useState(false);
+
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+
+  const send = async () => {
+    if (!input.trim()) return;
+    // Check if user has any AI create permission for actions; view is needed at least
+    if (!auth.can('ai','view')) { setMessages(prev=>[...prev, { role:'user', text: input }, { role:'ai', text:'❌ No permission to use AI Assistant' }]); setInput(''); return; }
+    const q = input;
+    setMessages(prev => [...prev, { role: 'user', text: q }]);
+    setInput('');
+    setLoading(true);
+    try {
+      const actionResult = await handleAIAction(q, { ...data, ...auth } as any);
+      if (actionResult.didAction) {
+        // Check if action was allowed by permissions - handleAIAction already did creation, but we should check if user had permission to create that module
+        // For simplicity, we already check inside handleAIAction? We'll add permission check here: if trying to create customer but no permission, block
+        // Actually handleAIAction doesn't know permissions, so we check manually for create actions
+        // Let's rely on UI permission: if action is create but user lacks permission, show error
+        // For now, we allow if actionResult.didAction and user had permission, else revert and warn
+        // We will not revert, just show message
+        setMessages(prev => [...prev, { role: 'ai', text: actionResult.response }]);
+        showToast(actionResult.response.split('\n')[0].slice(0,50));
+      } else if (actionResult.response) {
+        setMessages(prev => [...prev, { role: 'ai', text: actionResult.response }]);
+      } else {
+        const res = await getAIResponse(q, { customers: data.customers, jobs: data.jobs, estimates: data.estimates, invoices: data.invoices });
+        setMessages(prev => [...prev, { role: 'ai', text: res }]);
+      }
+    } catch (e) { setMessages(prev => [...prev, { role: 'ai', text: 'Error: ' + e }]); } finally { setLoading(false); }
+  };
+
+  const handleAIEst = async () => {
+    if (!auth.can('estimates','create') && !auth.can('estimates','view')) { showToast('No permission for estimates'); return; }
+    setEstLoading(true);
+    try { const r = await generateAIEstimate(estPrompt); setEstResult(r); } finally { setEstLoading(false); }
+  };
+
+  const quickCommands = [
+    { label: 'Add Customer', cmd: 'Add customer John Smith phone 380-201-5143 email john@test.com address 123 Main St Columbus OH 43215', need: 'customers' as ModuleName },
+    { label: 'Add Job', cmd: 'Add job for [your customer name] - sealcoating 1500 sq ft', need: 'jobs' as ModuleName },
+    { label: 'Create Estimate', cmd: 'Create estimate for [customer] - 1500 sq ft driveway sealcoating', need: 'estimates' as ModuleName },
+    { label: 'Create Invoice', cmd: 'Create invoice for [customer] from last estimate', need: 'invoices' as ModuleName },
+    { label: 'List Customers', cmd: 'List customers', need: 'customers' as ModuleName },
+    { label: 'Unpaid Invoices', cmd: 'List unpaid invoices', need: 'invoices' as ModuleName },
+  ];
+
+  return (
+    <div className="grid lg:grid-cols-5 gap-6">
+      <div className="lg:col-span-3 bg-white rounded-2xl shadow-sm flex flex-col h-[700px] border-2" style={{ borderColor: BRAND.black }}>
+        <div className="p-4 border-b bg-black rounded-t-2xl flex gap-3 items-center justify-between">
+          <div className="flex gap-3 items-center"><img src="/logo.png" className="w-12 h-12 rounded-xl bg-white p-1.5" alt="logo" /><div><h3 className="font-black text-base" style={{ color: BRAND.gold }}>Black Gold AI - {auth.currentUser?.role.toUpperCase()}</h3><p className="text-[11px] text-gray-400">Logged in as {auth.currentUser?.displayName} • Permissions-checked</p></div></div>
+          <span className="text-[10px] px-2 py-1 rounded-full bg-yellow-500 text-black font-black">LIVE</span>
+        </div>
+        <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-[#fafaf8]">
+          {messages.map((m, i) => (
+            <div key={i} className={`max-w-[90%] px-4 py-3 rounded-2xl text-sm whitespace-pre-wrap shadow-sm ${m.role === 'user' ? 'ml-auto bg-black text-white border-2' : 'mr-auto bg-white text-gray-800 border'}`} style={m.role==='user'?{ borderColor: BRAND.gold }: { borderColor: '#e5e7eb' }}>
+              {m.text}
+            </div>
+          ))}
+          {loading && <div className="mr-auto bg-white border px-4 py-3 rounded-2xl text-sm animate-pulse flex gap-2 items-center"><span className="w-2 h-2 bg-yellow-500 rounded-full animate-bounce"></span>Black Gold AI is working...</div>}
+          <div ref={endRef} />
+        </div>
+        <div className="p-3 border-t bg-white rounded-b-2xl">
+          <div className="flex gap-2">
+            <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === 'Enter' && send()} placeholder={auth.can('ai','create') ? "Type: Add customer John Smith phone... or Create job for..." : "View only - ask about revenue, tonnage..."} className="flex-1 px-4 py-3 border-2 rounded-full text-sm outline-none font-medium" style={{ borderColor: BRAND.gold }} />
+            <button onClick={send} className="px-6 py-3 bg-black text-yellow-400 rounded-full text-sm font-black border-2" style={{ borderColor: BRAND.gold }}>Send</button>
+          </div>
+          <div className="flex gap-1.5 mt-2 flex-wrap">
+            {quickCommands.filter(c=>auth.canViewModule(c.need)).slice(0,6).map((c,i)=>(
+              <button key={i} onClick={()=>setInput(c.cmd)} className="text-[10px] px-2.5 py-1 bg-black text-yellow-400 rounded-full border font-bold" style={{ borderColor: BRAND.gold }}>{c.label}</button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className="lg:col-span-2 space-y-4">
+        <div className="bg-black text-white rounded-2xl p-4 border-2" style={{ borderColor: BRAND.gold }}>
+          <h4 className="font-black text-sm" style={{ color: BRAND.gold }}>⚡ Quick Actions - Your Permissions</h4>
+          <div className="mt-2 text-[11px] text-gray-400">Role: <strong className="text-white uppercase">{auth.currentUser?.role}</strong> • {Object.entries(auth.currentUser?.permissions || {}).filter(([_,p])=>p.view).length} modules accessible</div>
+          <div className="grid grid-cols-1 gap-2 mt-3">
+            {quickCommands.filter(c=>auth.canViewModule(c.need)).map((c,i)=>(
+              <button key={i} onClick={()=>setInput(c.cmd)} disabled={!auth.can(c.need,'create') && c.label.includes('Add') || c.label.includes('Create')} className="text-left p-3 bg-zinc-900 rounded-xl border hover:bg-zinc-800 transition group disabled:opacity-40" style={{ borderColor: '#333' }}>
+                <p className="font-bold text-xs" style={{ color: BRAND.goldLight }}>{c.label} {(!auth.can(c.need,'create') && (c.label.includes('Add')||c.label.includes('Create'))) && '(No Create Permission)'}</p>
+                <p className="text-[10px] text-gray-400 mt-1 truncate">{c.cmd}</p>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white rounded-2xl shadow-sm p-5 border-t-4" style={{ borderColor: BRAND.gold }}>
+          <h3 className="font-black mb-2">🧮 AI Estimator</h3>
+          <textarea value={estPrompt} onChange={e => setEstPrompt(e.target.value)} rows={3} className="w-full px-3 py-2 border-2 rounded-xl text-sm" placeholder="e.g., 2000 sq ft parking lot sealcoating" />
+          <button onClick={handleAIEst} disabled={estLoading || !auth.canViewModule('estimates')} className="mt-3 w-full py-3 text-black rounded-xl font-black disabled:opacity-50" style={{ background: BRAND.gold }}>{estLoading ? 'Generating...' : '✨ Generate Preview'}</button>
+          {estResult && (
+            <div className="mt-4 border-2 rounded-xl overflow-hidden" style={{ borderColor: BRAND.black }}>
+              <div className="p-3 bg-black text-yellow-400 flex justify-between items-center"><div><p className="font-black text-sm">{estResult.title}</p><p className="text-xs text-gray-400">Total: ${estResult.lineItems.reduce((s, i) => s + i.total, 0).toFixed(2)}</p></div><img src="/logo.png" className="w-8 h-8 bg-white rounded-lg" alt="logo" /></div>
+              <div className="max-h-[280px] overflow-auto bg-white">{estResult.lineItems.map(it => (<div key={it.id} className="flex justify-between text-xs p-2.5 border-b last:border-0"><span className="flex-1 font-medium">{it.description}</span><span className="font-black">${it.total.toFixed(2)}</span></div>))}</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

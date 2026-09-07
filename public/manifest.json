@@ -1,0 +1,21 @@
+{
+  "name": "Asphalt Assistant - Paving Business Management",
+  "short_name": "Asphalt Assistant",
+  "description": "All-in-one paving business management - estimates, invoices, contracts, jobs, map, AI - works offline - white-label ready",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#FF8C00",
+  "icons": [
+    {
+      "src": "/app-logo.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/app-logo.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
